@@ -5,7 +5,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import QRCode from "qrcode";
 import { CheckCircle2, QrCode, StepForward, Users, X } from "lucide-react";
 import { AnswerGrid } from "@/components/game/answer-grid";
+import { useGameCountdown } from "@/hooks/use-game-countdown";
 import { ANSWER_LABELS, ANSWER_NETWORK_GRACE_MS } from "@/lib/game/constants";
+import { estimateServerOffsetMs, shouldApplyResponse } from "@/lib/game/countdown.mjs";
 import { createBrowserClient } from "@/lib/supabase/browser";
 
 type Participant = { id: string; nickname: string; score: number };
@@ -20,7 +22,6 @@ type Snapshot = {
     question_ends_at: string | null;
     quizzes: { title: string; questions: { id: string }[] };
   };
-  participantCount: number;
   serverNow: string;
 };
 type QuestionPayload = {
@@ -31,6 +32,7 @@ type QuestionPayload = {
   serverNow: string;
   question: {
     id: string;
+    order_index: number;
     question_text: string;
     time_limit: number;
     answers: { id: string; answer_text: string; answer_index: number }[];
@@ -47,6 +49,11 @@ type ResultPayload = {
   questionTop5: { rank: number; nickname: string; scoreAwarded: number }[];
   cumulativeTop5: { rank: number; nickname: string; score: number }[];
 };
+type CommandPayload = {
+  snapshot?: Snapshot;
+  question?: QuestionPayload | null;
+  serverNow?: string;
+};
 
 export function GameControl({ gameId }: { gameId: string }) {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
@@ -56,9 +63,21 @@ export function GameControl({ gameId }: { gameId: string }) {
   const [qr, setQr] = useState("");
   const [message, setMessage] = useState("");
   const [showCumulative, setShowCumulative] = useState(false);
-  const [now, setNow] = useState(0);
-  const [serverOffsetMs, setServerOffsetMs] = useState(0);
-  const refreshTimerRef = useRef<number | null>(null);
+  const [submittedCount, setSubmittedCount] = useState(0);
+  const [questionClock, setQuestionClock] = useState({ questionId: "", offsetMs: 0 });
+  const snapshotRef = useRef<Snapshot | null>(null);
+  const questionRef = useRef<QuestionPayload | null>(null);
+  const gameRefreshTimerRef = useRef<number | null>(null);
+  const participantRefreshTimerRef = useRef<number | null>(null);
+  const answerCountRefreshTimerRef = useRef<number | null>(null);
+  const latestSnapshotRequestRef = useRef(0);
+  const latestParticipantRequestRef = useRef(0);
+  const latestQuestionRequestRef = useRef(0);
+  const latestResultRequestRef = useRef(0);
+  const latestAnswerCountRequestRef = useRef(0);
+  const autoCloseQuestionRef = useRef("");
+  const loadedResultIndexRef = useRef<number | null>(null);
+  const resultInFlightRef = useRef<{ index: number; promise: Promise<void> } | null>(null);
 
   const joinUrl = useMemo(() => {
     if (typeof window === "undefined" || !snapshot) return "";
@@ -66,126 +85,223 @@ export function GameControl({ gameId }: { gameId: string }) {
     return `${configuredUrl || window.location.origin}/join?pin=${snapshot.game.pin}`;
   }, [snapshot]);
 
-  const syncServerClock = useCallback((serverNow: string | null | undefined) => {
-    if (!serverNow) return;
-    const serverNowMs = new Date(serverNow).getTime();
-    if (Number.isFinite(serverNowMs)) {
-      setServerOffsetMs(serverNowMs - Date.now());
-    }
+  const applySnapshot = useCallback((nextSnapshot: Snapshot) => {
+    snapshotRef.current = nextSnapshot;
+    setSnapshot(nextSnapshot);
   }, []);
 
-  const refresh = useCallback(async () => {
-    const [snapshotResponse, participantsResponse, questionResponse, resultResponse] = await Promise.all([
-      fetch(`/api/games/${gameId}/snapshot`),
-      fetch(`/api/games/${gameId}/participants`),
-      fetch(`/api/games/${gameId}/host-question`).catch(() => null),
-      fetch(`/api/games/${gameId}/result`).catch(() => null),
-    ]);
+  const applyQuestion = useCallback((payload: QuestionPayload, offsetMs: number) => {
+    const questionId = payload.question.id;
+    if (questionRef.current?.question.id === questionId) return;
+    questionRef.current = payload;
+    setQuestion(payload);
+    setQuestionClock({ questionId, offsetMs });
+    setSubmittedCount(0);
+    autoCloseQuestionRef.current = "";
+  }, []);
 
-    if (snapshotResponse.ok) {
-      const body = (await snapshotResponse.json()) as Snapshot;
-      syncServerClock(body.serverNow);
-      setSnapshot(body);
-    }
-    if (participantsResponse.ok) {
-      const body = (await participantsResponse.json()) as { participants: Participant[] };
-      setParticipants(body.participants);
-    }
-    if (questionResponse?.ok) {
-      const body = (await questionResponse.json()) as QuestionPayload;
-      syncServerClock(body.serverNow);
-      setQuestion(body);
-    }
-    if (resultResponse?.ok) setResult((await resultResponse.json()) as ResultPayload);
-  }, [gameId, syncServerClock]);
+  const loadParticipants = useCallback(async () => {
+    const requestId = ++latestParticipantRequestRef.current;
+    const response = await fetch(`/api/games/${gameId}/participants`, { cache: "no-store" });
+    if (!response.ok || !shouldApplyResponse(requestId, latestParticipantRequestRef.current)) return;
+    const body = (await response.json()) as { participants: Participant[] };
+    if (shouldApplyResponse(requestId, latestParticipantRequestRef.current)) setParticipants(body.participants);
+  }, [gameId]);
 
-  const scheduleRefresh = useCallback(() => {
-    if (refreshTimerRef.current) {
-      window.clearTimeout(refreshTimerRef.current);
+  const loadAnswerCount = useCallback(async (questionId: string) => {
+    const requestId = ++latestAnswerCountRequestRef.current;
+    const response = await fetch(
+      `/api/games/${gameId}/answer-count?questionId=${encodeURIComponent(questionId)}`,
+      { cache: "no-store" },
+    );
+    if (!response.ok || !shouldApplyResponse(requestId, latestAnswerCountRequestRef.current)) return;
+    const body = (await response.json()) as { questionId: string; submittedCount: number };
+    if (
+      shouldApplyResponse(requestId, latestAnswerCountRequestRef.current) &&
+      questionRef.current?.question.id === body.questionId
+    ) {
+      setSubmittedCount(body.submittedCount);
     }
-    refreshTimerRef.current = window.setTimeout(() => {
-      refreshTimerRef.current = null;
-      void refresh();
-    }, 150);
-  }, [refresh]);
+  }, [gameId]);
+
+  const loadQuestion = useCallback(async () => {
+    const requestId = ++latestQuestionRequestRef.current;
+    const requestStartedAt = performance.now();
+    const response = await fetch(`/api/games/${gameId}/host-question`, { cache: "no-store" });
+    const requestEndedAt = performance.now();
+    if (!response.ok || !shouldApplyResponse(requestId, latestQuestionRequestRef.current)) return;
+    const payload = (await response.json()) as QuestionPayload;
+    if (!shouldApplyResponse(requestId, latestQuestionRequestRef.current)) return;
+    const offsetMs = estimateServerOffsetMs(payload.serverNow, requestEndedAt - requestStartedAt, Date.now());
+    applyQuestion(payload, offsetMs);
+    void loadAnswerCount(payload.question.id);
+  }, [applyQuestion, gameId, loadAnswerCount]);
+
+  const loadResult = useCallback(() => {
+    const questionIndex = snapshotRef.current?.game.current_question_index;
+    if (questionIndex === undefined || loadedResultIndexRef.current === questionIndex) return Promise.resolve();
+    if (resultInFlightRef.current?.index === questionIndex) return resultInFlightRef.current.promise;
+
+    const requestId = ++latestResultRequestRef.current;
+    const promise = (async () => {
+      const response = await fetch(`/api/games/${gameId}/result`, { cache: "no-store" });
+      if (!response.ok || !shouldApplyResponse(requestId, latestResultRequestRef.current)) return;
+      const payload = (await response.json()) as ResultPayload;
+      if (shouldApplyResponse(requestId, latestResultRequestRef.current)) {
+        loadedResultIndexRef.current = payload.question.orderIndex;
+        setResult(payload);
+        setSubmittedCount(payload.submittedCount);
+      }
+    })();
+    resultInFlightRef.current = { index: questionIndex, promise };
+    void promise.finally(() => {
+      if (resultInFlightRef.current?.promise === promise) resultInFlightRef.current = null;
+    });
+    return promise;
+  }, [gameId]);
+
+  const refreshState = useCallback(async () => {
+    const requestId = ++latestSnapshotRequestRef.current;
+    const response = await fetch(`/api/games/${gameId}/snapshot`, { cache: "no-store" });
+    if (!response.ok || !shouldApplyResponse(requestId, latestSnapshotRequestRef.current)) return;
+    const nextSnapshot = (await response.json()) as Snapshot;
+    if (!shouldApplyResponse(requestId, latestSnapshotRequestRef.current)) return;
+    applySnapshot(nextSnapshot);
+
+    if (nextSnapshot.game.status === "QUESTION") {
+      if (questionRef.current?.question.order_index !== nextSnapshot.game.current_question_index) {
+        await loadQuestion();
+      }
+    } else if (nextSnapshot.game.status === "QUESTION_RESULT" || nextSnapshot.game.status === "FINISHED") {
+      await loadResult();
+    }
+  }, [applySnapshot, gameId, loadQuestion, loadResult]);
+
+  const scheduleGameRefresh = useCallback(() => {
+    if (gameRefreshTimerRef.current !== null) return;
+    gameRefreshTimerRef.current = window.setTimeout(() => {
+      gameRefreshTimerRef.current = null;
+      void refreshState();
+    }, 80);
+  }, [refreshState]);
+
+  const scheduleParticipantRefresh = useCallback(() => {
+    if (snapshotRef.current?.game.status !== "LOBBY" || participantRefreshTimerRef.current !== null) return;
+    participantRefreshTimerRef.current = window.setTimeout(() => {
+      participantRefreshTimerRef.current = null;
+      void loadParticipants();
+    }, 100);
+  }, [loadParticipants]);
+
+  const scheduleAnswerCountRefresh = useCallback(() => {
+    if (snapshotRef.current?.game.status !== "QUESTION" || answerCountRefreshTimerRef.current !== null) return;
+    answerCountRefreshTimerRef.current = window.setTimeout(() => {
+      answerCountRefreshTimerRef.current = null;
+      const questionId = questionRef.current?.question.id;
+      if (questionId) void loadAnswerCount(questionId);
+    }, 120);
+  }, [loadAnswerCount]);
 
   useEffect(() => {
-    scheduleRefresh();
+    void Promise.all([refreshState(), loadParticipants()]);
     const supabase = createBrowserClient();
-    if (!supabase) {
-      return () => {
-        if (refreshTimerRef.current) {
-          window.clearTimeout(refreshTimerRef.current);
-          refreshTimerRef.current = null;
-        }
-      };
-    }
+    if (!supabase) return;
 
     const channel = supabase
       .channel(`admin-game-${gameId}`)
-      .on("postgres_changes", { event: "*", schema: "public", table: "games", filter: `id=eq.${gameId}` }, scheduleRefresh)
-      .on("postgres_changes", { event: "*", schema: "public", table: "participants", filter: `game_id=eq.${gameId}` }, scheduleRefresh)
-      .on("postgres_changes", { event: "*", schema: "public", table: "participant_answers", filter: `game_id=eq.${gameId}` }, scheduleRefresh)
+      .on("postgres_changes", { event: "*", schema: "public", table: "games", filter: `id=eq.${gameId}` }, scheduleGameRefresh)
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "participants", filter: `game_id=eq.${gameId}` }, scheduleParticipantRefresh)
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "participant_answers", filter: `game_id=eq.${gameId}` }, scheduleAnswerCountRefresh)
       .subscribe();
 
     return () => {
       void supabase.removeChannel(channel);
-      if (refreshTimerRef.current) {
-        window.clearTimeout(refreshTimerRef.current);
-        refreshTimerRef.current = null;
+      for (const timerRef of [gameRefreshTimerRef, participantRefreshTimerRef, answerCountRefreshTimerRef]) {
+        if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+        timerRef.current = null;
       }
     };
-  }, [gameId, scheduleRefresh]);
+  }, [gameId, loadParticipants, refreshState, scheduleAnswerCountRefresh, scheduleGameRefresh, scheduleParticipantRefresh]);
 
   useEffect(() => {
     if (joinUrl) void QRCode.toDataURL(joinUrl, { margin: 1, width: 220 }).then(setQr);
   }, [joinUrl]);
 
-  useEffect(() => {
-    const timer = window.setInterval(() => setNow(Date.now()), 250);
-    return () => window.clearInterval(timer);
-  }, []);
-
-  const remaining = useMemo(() => {
-    const endsAt = question?.questionEndsAt ?? snapshot?.game.question_ends_at;
-    const startsAt = question?.questionStartsAt ?? snapshot?.game.question_starts_at;
-    const effectiveNow = now + serverOffsetMs;
-    if (!endsAt || !effectiveNow) return question?.question.time_limit ?? 0;
-    if (startsAt && new Date(startsAt).getTime() > effectiveNow) {
-      return question?.question.time_limit ?? 0;
-    }
-    return Math.max(0, Math.ceil((new Date(endsAt).getTime() - effectiveNow) / 1000));
-  }, [now, question, serverOffsetMs, snapshot?.game.question_ends_at, snapshot?.game.question_starts_at]);
-
-  const settleDelayMs = useMemo(() => {
-    const endsAt = question?.questionEndsAt ?? snapshot?.game.question_ends_at;
-    if (!endsAt || !now) return ANSWER_NETWORK_GRACE_MS;
-    const effectiveNow = now + serverOffsetMs;
-    return Math.max(0, new Date(endsAt).getTime() + ANSWER_NETWORK_GRACE_MS - effectiveNow);
-  }, [now, question?.questionEndsAt, serverOffsetMs, snapshot?.game.question_ends_at]);
+  const countdown = useGameCountdown({
+    questionId: question?.question.id,
+    startsAt: question?.questionStartsAt,
+    endsAt: question?.questionEndsAt,
+    timeLimitSeconds: question?.question.time_limit,
+    serverOffsetMs: questionClock.questionId === question?.question.id ? questionClock.offsetMs : 0,
+    graceMs: ANSWER_NETWORK_GRACE_MS,
+  });
 
   useEffect(() => {
-    if (snapshot?.game.status !== "QUESTION" || remaining > 0) return;
-    const timer = window.setTimeout(() => {
-      void fetch(`/api/games/${gameId}/auto-close`, { method: "POST" }).then(() => refresh());
-    }, settleDelayMs + 50);
-    return () => window.clearTimeout(timer);
-  }, [gameId, refresh, remaining, settleDelayMs, snapshot?.game.status]);
+    const questionId = question?.question.id;
+    if (snapshot?.game.status !== "QUESTION" || !questionId || !countdown.closeAtLocalMs) return;
+    let cancelled = false;
+    let retryTimer: number | null = null;
+
+    const close = async () => {
+      if (cancelled || autoCloseQuestionRef.current === questionId) return;
+      const response = await fetch(`/api/games/${gameId}/auto-close`, { method: "POST" });
+      const body = (await response.json().catch(() => null)) as { closed?: boolean; reason?: string } | null;
+      if (cancelled || !response.ok) return;
+      if (!body?.closed && body?.reason === "not_ready") {
+        retryTimer = window.setTimeout(() => void close(), 200);
+        return;
+      }
+      autoCloseQuestionRef.current = questionId;
+      const current = snapshotRef.current;
+      if (current) {
+        latestSnapshotRequestRef.current += 1;
+        applySnapshot({ ...current, game: { ...current.game, status: "QUESTION_RESULT" } });
+      }
+      await loadResult();
+    };
+
+    const delayMs = Math.max(0, countdown.closeAtLocalMs + 75 - Date.now());
+    const timer = window.setTimeout(() => void close(), delayMs);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+      if (retryTimer !== null) window.clearTimeout(retryTimer);
+    };
+  }, [applySnapshot, countdown.closeAtLocalMs, gameId, loadResult, question?.question.id, snapshot?.game.status]);
 
   async function command(path: string) {
     setMessage("");
+    const requestStartedAt = performance.now();
     const response = await fetch(path, { method: "POST" });
+    const requestEndedAt = performance.now();
+    const body = (await response.json().catch(() => null)) as (CommandPayload & { error?: string }) | null;
     if (!response.ok) {
-      const body = (await response.json().catch(() => null)) as { error?: string } | null;
       setMessage(body?.error || "요청을 처리하지 못했습니다.");
+      return;
     }
-    await refresh();
+    latestSnapshotRequestRef.current += 1;
+    latestQuestionRequestRef.current += 1;
+    latestResultRequestRef.current += 1;
+    if (body?.snapshot) applySnapshot(body.snapshot);
+    if (body?.question) {
+      const offsetMs = estimateServerOffsetMs(
+        body.serverNow ?? body.question.serverNow,
+        requestEndedAt - requestStartedAt,
+        Date.now(),
+      );
+      applyQuestion(body.question, offsetMs);
+      return;
+    }
+    if (path.endsWith("/end-question")) {
+      const current = snapshotRef.current;
+      if (current) applySnapshot({ ...current, game: { ...current.game, status: "QUESTION_RESULT" } });
+      await loadResult();
+    }
   }
 
   const status = snapshot?.game.status ?? "LOADING";
   const questionCount = snapshot?.game.quizzes.questions.length ?? result?.totalQuestions ?? 0;
-  const submittedCount = result?.submittedCount ?? 0;
-  const participantCount = result?.participantCount ?? participants.length;
+  const participantCount = participants.length || result?.participantCount || 0;
 
   if (status === "QUESTION") {
     return (
@@ -195,8 +311,8 @@ export function GameControl({ gameId }: { gameId: string }) {
         question={question}
         questionCount={questionCount}
         questionIndex={snapshot?.game.current_question_index ?? 0}
-        remaining={remaining}
-        settling={remaining === 0}
+        phase={countdown.phase}
+        remaining={countdown.remaining}
         submittedCount={submittedCount}
       />
     );
@@ -247,8 +363,8 @@ function QuestionPresenterView({
   question,
   questionCount,
   questionIndex,
+  phase,
   remaining,
-  settling,
   submittedCount,
 }: {
   onEnd: () => void;
@@ -256,18 +372,23 @@ function QuestionPresenterView({
   question: QuestionPayload | null;
   questionCount: number;
   questionIndex: number;
+  phase: "idle" | "preparing" | "active" | "settling" | "closed";
   remaining: number;
-  settling: boolean;
   submittedCount: number;
 }) {
+  const timerLabel =
+    phase === "preparing" || phase === "idle"
+      ? "준비"
+      : phase === "active"
+        ? `남은 시간 ${remaining}초`
+        : "응답 집계 중...";
+
   return (
     <main className="fixed inset-0 z-50 flex h-screen max-h-screen flex-col overflow-hidden bg-[#f7f3ec] p-[clamp(0.5rem,1.4vh,1rem)]">
       <header className="grid min-h-0 grid-cols-3 items-center gap-3 rounded-[8px] bg-white px-[clamp(0.75rem,1.4vw,1.5rem)] py-[clamp(0.45rem,1vh,0.8rem)] shadow-sm">
         <div className="text-[clamp(1rem,2.4vh,1.8rem)] font-black">문제 {questionIndex + 1} / {questionCount}</div>
         <div className="text-center text-[clamp(1rem,2.4vh,1.8rem)] font-black">답변 {submittedCount} / {participantCount}</div>
-        <div className="text-right text-[clamp(1.1rem,3.2vh,2.4rem)] font-black">
-          {settling ? "응답 집계 중..." : `남은 시간 ${remaining}초`}
-        </div>
+        <div className="text-right text-[clamp(1.1rem,3.2vh,2.4rem)] font-black">{timerLabel}</div>
       </header>
 
       <section className="grid min-h-0 flex-[0_0_16vh] place-items-center px-[clamp(0.5rem,1vw,1rem)] py-[clamp(0.35rem,1vh,0.75rem)]">

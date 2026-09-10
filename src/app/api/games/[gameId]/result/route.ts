@@ -1,6 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requireAdmin } from "@/lib/auth/session";
-import { maybeCloseQuestion } from "@/lib/game/close-question";
 import { jsonError, parseError } from "@/lib/http";
 import { createServiceClient } from "@/lib/supabase/server";
 
@@ -25,8 +24,6 @@ export async function GET(_request: NextRequest, context: { params: Promise<{ ga
     const { gameId } = await context.params;
     const supabase = createServiceClient();
 
-    await maybeCloseQuestion(supabase, gameId, "expired");
-
     const { data: game } = await supabase
       .from("games")
       .select("id,quiz_id,status,current_question_index,question_started_at,question_starts_at,question_ends_at,quizzes(questions(id))")
@@ -49,45 +46,40 @@ export async function GET(_request: NextRequest, context: { params: Promise<{ ga
     const answers = ([...(question.answers as AnswerRow[])]).sort(
       (first, second) => first.answer_index - second.answer_index,
     );
-    const { data: answerCounts } = await supabase
-      .from("participant_answers")
-      .select("answer_id")
-      .eq("game_id", gameId)
-      .eq("question_id", question.id);
+    const [answerCountsResult, questionTopResult, cumulativeResult, participantCountResult] = await Promise.all([
+      supabase
+        .from("participant_answers")
+        .select("answer_id")
+        .eq("game_id", gameId)
+        .eq("question_id", question.id),
+      supabase
+        .from("participant_answers")
+        .select("id,score_awarded,response_time_ms,submitted_at,participants(nickname)")
+        .eq("game_id", gameId)
+        .eq("question_id", question.id)
+        .eq("is_correct", true)
+        .order("score_awarded", { ascending: false })
+        .order("response_time_ms", { ascending: true })
+        .order("submitted_at", { ascending: true })
+        .limit(5),
+      supabase
+        .from("participants")
+        .select("id,nickname,score")
+        .eq("game_id", gameId)
+        .order("score", { ascending: false })
+        .order("joined_at", { ascending: true })
+        .limit(5),
+      supabase.from("participants").select("id", { count: "exact", head: true }).eq("game_id", gameId),
+    ]);
+    const answerCounts = answerCountsResult.data;
+    const questionTopRows = questionTopResult.data;
+    const cumulativeRows = cumulativeResult.data;
+    const participantCount = participantCountResult.count;
     const countMap = new Map<string, number>();
     for (const row of answerCounts ?? []) {
       const answerId = row.answer_id as string;
       countMap.set(answerId, (countMap.get(answerId) ?? 0) + 1);
     }
-
-    const { data: questionTopRows } = await supabase
-      .from("participant_answers")
-      .select("id,score_awarded,response_time_ms,submitted_at,participants(nickname)")
-      .eq("game_id", gameId)
-      .eq("question_id", question.id)
-      .eq("is_correct", true)
-      .order("score_awarded", { ascending: false })
-      .order("response_time_ms", { ascending: true })
-      .order("submitted_at", { ascending: true })
-      .limit(5);
-
-    const { data: cumulativeRows } = await supabase
-      .from("participants")
-      .select("id,nickname,score")
-      .eq("game_id", gameId)
-      .order("score", { ascending: false })
-      .order("joined_at", { ascending: true })
-      .limit(5);
-
-    const [{ count: submittedCount }, { count: participantCount }] = await Promise.all([
-      supabase
-        .from("participant_answers")
-        .select("id", { count: "exact", head: true })
-        .eq("game_id", gameId)
-        .eq("question_id", question.id),
-      supabase.from("participants").select("id", { count: "exact", head: true }).eq("game_id", gameId),
-    ]);
-
     const questions = Array.isArray(game.quizzes)
       ? game.quizzes[0]?.questions
       : (game.quizzes as { questions?: { id: string }[] } | null)?.questions;
@@ -108,7 +100,7 @@ export async function GET(_request: NextRequest, context: { params: Promise<{ ga
         isCorrect: answer.is_correct,
         count: countMap.get(answer.id) ?? 0,
       })),
-      submittedCount: submittedCount ?? 0,
+      submittedCount: answerCounts?.length ?? 0,
       participantCount: participantCount ?? 0,
       totalQuestions,
       isLastQuestion: Number(game.current_question_index) >= totalQuestions - 1,

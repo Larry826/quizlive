@@ -37,7 +37,7 @@ test("participant question api does not select visible question or answer text",
 
 test("participant submitted state renders a waiting screen instead of the answer grid", () => {
   const playClientSource = readFileSync("src/components/participant/play-client.tsx", "utf8");
-  assert.ok(playClientSource.includes('snapshot.game.status === "QUESTION" && submitted'));
+  assert.ok(playClientSource.includes('gameState.status === "QUESTION" && submitted'));
   assert.ok(playClientSource.includes('title="답변 완료!"'));
 });
 
@@ -68,7 +68,8 @@ test("answer submission uses database guardrails for duplicate and score updates
   const answerRouteSource = readFileSync("src/app/api/games/[gameId]/answer/route.ts", "utf8");
   const schemaSource = readFileSync("supabase/schema.sql", "utf8");
   assert.ok(schemaSource.includes("unique (game_id, question_id, participant_id)"));
-  assert.ok(answerRouteSource.includes('rpc("increment_participant_score"'));
+  assert.ok(schemaSource.includes("function public.submit_quiz_answer"));
+  assert.ok(answerRouteSource.includes('rpc("submit_quiz_answer"'));
   assert.equal(answerRouteSource.includes("score: Number(participant.score) + scoreAwarded"), false);
 });
 
@@ -94,10 +95,11 @@ test("deadline close and answer submission use server grace without client times
   const constantsSource = readFileSync("src/lib/game/constants.ts", "utf8");
   const closeQuestionSource = readFileSync("src/lib/game/close-question.ts", "utf8");
   const answerRouteSource = readFileSync("src/app/api/games/[gameId]/answer/route.ts", "utf8");
+  const submissionMigrationSource = readFileSync("supabase/migrations/202609100005_timer_and_submission_performance.sql", "utf8");
   assert.ok(constantsSource.includes("ANSWER_NETWORK_GRACE_MS = 1500"));
   assert.ok(closeQuestionSource.includes("ANSWER_NETWORK_GRACE_MS <= Date.now()"));
-  assert.ok(answerRouteSource.includes("endsAt + ANSWER_NETWORK_GRACE_MS <= now"));
-  assert.ok(answerRouteSource.includes("Math.min(now, endsAt) - startsAt"));
+  assert.ok(submissionMigrationSource.includes("interval '1500 milliseconds'"));
+  assert.ok(submissionMigrationSource.includes("least(v_received_at, v_ends_at)"));
   assert.equal(answerRouteSource.includes("clicked_at"), false);
 });
 

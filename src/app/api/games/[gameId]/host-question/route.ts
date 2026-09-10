@@ -1,6 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requireAdmin } from "@/lib/auth/session";
-import { maybeCloseQuestion } from "@/lib/game/close-question";
 import { jsonError, parseError } from "@/lib/http";
 import { createServiceClient } from "@/lib/supabase/server";
 
@@ -9,7 +8,6 @@ export async function GET(_request: NextRequest, context: { params: Promise<{ ga
     await requireAdmin();
     const { gameId } = await context.params;
     const supabase = createServiceClient();
-    await maybeCloseQuestion(supabase, gameId, "expired");
 
     const { data: game } = await supabase
       .from("games")

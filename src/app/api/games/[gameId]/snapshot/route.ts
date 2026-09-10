@@ -13,10 +13,5 @@ export async function GET(_request: NextRequest, context: { params: Promise<{ ga
   if (error || !game) {
     return jsonError(error?.message || "게임을 찾을 수 없습니다.", 404);
   }
-  const { count } = await supabase
-    .from("participants")
-    .select("id", { count: "exact", head: true })
-    .eq("game_id", gameId);
-
-  return NextResponse.json({ game, participantCount: count ?? 0, serverNow: new Date().toISOString() });
+  return NextResponse.json({ game, serverNow: new Date().toISOString() });
 }
