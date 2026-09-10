@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requireAdmin } from "@/lib/auth/session";
+import { PREPARE_DELAY_MS } from "@/lib/game/constants";
 import { jsonError, parseError } from "@/lib/http";
 import { createServiceClient } from "@/lib/supabase/server";
 
@@ -25,6 +26,8 @@ export async function POST(_request: NextRequest, context: { params: Promise<{ g
       .eq("quiz_id", game.quiz_id);
     const nextIndex = Number(game.current_question_index) + 1;
     const finished = nextIndex >= (count ?? 0);
+    const transitionAt = new Date();
+    const startsAt = new Date(transitionAt.getTime() + PREPARE_DELAY_MS);
     let questionEndsAt: string | null = null;
     if (!finished) {
       const { data: nextQuestion } = await supabase
@@ -33,15 +36,16 @@ export async function POST(_request: NextRequest, context: { params: Promise<{ g
         .eq("quiz_id", game.quiz_id)
         .eq("order_index", nextIndex)
         .single();
-      questionEndsAt = new Date(Date.now() + Number(nextQuestion?.time_limit ?? 15) * 1000).toISOString();
+      questionEndsAt = new Date(startsAt.getTime() + Number(nextQuestion?.time_limit ?? 15) * 1000).toISOString();
     }
     const { error } = await supabase
       .from("games")
       .update({
         status: finished ? "FINISHED" : "QUESTION",
         current_question_index: finished ? game.current_question_index : nextIndex,
-        ended_at: finished ? new Date().toISOString() : null,
-        question_started_at: finished ? null : new Date().toISOString(),
+        ended_at: finished ? transitionAt.toISOString() : null,
+        question_started_at: finished ? null : transitionAt.toISOString(),
+        question_starts_at: finished ? null : startsAt.toISOString(),
         question_ends_at: questionEndsAt,
       })
       .eq("id", gameId);

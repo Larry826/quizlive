@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { CheckCircle2, Clock, Hourglass } from "lucide-react";
 import { AnswerGrid } from "@/components/game/answer-grid";
@@ -14,15 +14,19 @@ type Snapshot = {
     status: string;
     current_question_index: number;
     question_started_at: string | null;
+    question_starts_at: string | null;
     question_ends_at: string | null;
     quizzes: { title: string; questions: { id: string }[] };
   };
   participantCount: number;
+  serverNow: string;
 };
 type QuestionPayload = {
   status: string;
   questionStartedAt: string | null;
+  questionStartsAt: string | null;
   questionEndsAt: string | null;
+  serverNow: string;
   submittedAnswerId: string | null;
   question: {
     id: string;
@@ -45,23 +49,43 @@ export function PlayClient({ gameId }: { gameId: string }) {
   const [submitted, setSubmitted] = useState(false);
   const [submitError, setSubmitError] = useState("");
   const [now, setNow] = useState(0);
+  const [serverOffsetMs, setServerOffsetMs] = useState(0);
+  const inFlightQuestionKeyRef = useRef("");
   const questionKey = question?.question.id ?? "none";
+
+  const syncServerClock = useCallback((serverNow: string | null | undefined) => {
+    if (!serverNow) return;
+    const serverNowMs = new Date(serverNow).getTime();
+    if (Number.isFinite(serverNowMs)) {
+      setServerOffsetMs(serverNowMs - Date.now());
+    }
+  }, []);
 
   const refresh = useCallback(async () => {
     const snapshotResponse = await fetch(`/api/games/${gameId}/snapshot`);
     if (!snapshotResponse.ok) return;
 
     const nextSnapshot = (await snapshotResponse.json()) as Snapshot;
+    syncServerClock(nextSnapshot.serverNow);
     setSnapshot(nextSnapshot);
 
     if (nextSnapshot.game.status === "QUESTION") {
-      const questionResponse = await fetch(`/api/games/${gameId}/question?participantId=${participant?.id ?? ""}`);
-      if (questionResponse.ok) {
-        const payload = (await questionResponse.json()) as QuestionPayload;
-        setQuestion(payload);
-        if (payload.submittedAnswerId) {
-          setSelected(payload.submittedAnswerId);
-          setSubmitted(true);
+      const requestKey = `${nextSnapshot.game.current_question_index}:${nextSnapshot.game.question_starts_at ?? ""}`;
+      if (inFlightQuestionKeyRef.current !== requestKey) {
+        inFlightQuestionKeyRef.current = requestKey;
+        try {
+          const questionResponse = await fetch(`/api/games/${gameId}/question?participantId=${participant?.id ?? ""}`);
+          if (questionResponse.ok) {
+            const payload = (await questionResponse.json()) as QuestionPayload;
+            syncServerClock(payload.serverNow);
+            setQuestion(payload);
+            if (payload.submittedAnswerId) {
+              setSelected(payload.submittedAnswerId);
+              setSubmitted(true);
+            }
+          }
+        } finally {
+          inFlightQuestionKeyRef.current = "";
         }
       }
     }
@@ -69,7 +93,7 @@ export function PlayClient({ gameId }: { gameId: string }) {
     if (nextSnapshot.game.status === "FINISHED") {
       router.push(`/results/${gameId}`);
     }
-  }, [gameId, participant?.id, router]);
+  }, [gameId, participant?.id, router, syncServerClock]);
 
   useEffect(() => {
     if (!participant) {
@@ -107,9 +131,19 @@ export function PlayClient({ gameId }: { gameId: string }) {
   }, []);
 
   const remaining = useMemo(() => {
-    if (!question?.questionEndsAt || !now) return question?.question.time_limit ?? 0;
-    return Math.max(0, Math.ceil((new Date(question.questionEndsAt).getTime() - now) / 1000));
-  }, [question, now]);
+    const effectiveNow = now + serverOffsetMs;
+    if (!question?.questionEndsAt || !effectiveNow) return question?.question.time_limit ?? 0;
+    if (question.questionStartsAt && new Date(question.questionStartsAt).getTime() > effectiveNow) {
+      return question.question.time_limit;
+    }
+    return Math.max(0, Math.ceil((new Date(question.questionEndsAt).getTime() - effectiveNow) / 1000));
+  }, [question, now, serverOffsetMs]);
+
+  const isAnswerOpen = useMemo(() => {
+    const effectiveNow = now + serverOffsetMs;
+    if (!question?.questionStartsAt || !question.questionEndsAt || !effectiveNow) return false;
+    return new Date(question.questionStartsAt).getTime() <= effectiveNow && effectiveNow < new Date(question.questionEndsAt).getTime();
+  }, [now, question, serverOffsetMs]);
 
   useEffect(() => {
     if (snapshot?.game.status !== "QUESTION" || remaining > 0) return;
@@ -120,9 +154,10 @@ export function PlayClient({ gameId }: { gameId: string }) {
   }, [refresh, remaining, snapshot?.game.status]);
 
   async function submit(answerId: string) {
-    if (!participant || selected || submitted) return;
+    if (!participant || selected || submitted || !isAnswerOpen) return;
 
     setSelected(answerId);
+    setSubmitted(true);
     setSubmitError("");
     const response = await fetch(`/api/games/${gameId}/answer`, {
       method: "POST",
@@ -166,6 +201,10 @@ export function PlayClient({ gameId }: { gameId: string }) {
     );
   }
 
+  if (snapshot.game.status === "QUESTION" && question && !isAnswerOpen) {
+    return <Centered title="문제 준비 중..." body={`잠시 후 응답이 시작됩니다. 제한시간은 ${remaining}초입니다.`} />;
+  }
+
   return (
     <main className="min-h-screen overflow-hidden px-3 py-3">
       <section className="mx-auto flex h-[calc(100vh-24px)] max-w-xl flex-col gap-3">
@@ -176,7 +215,7 @@ export function PlayClient({ gameId }: { gameId: string }) {
         <AnswerGrid
           answers={question?.question.answers ?? []}
           className="min-h-0"
-          disabled={Boolean(selected) || remaining === 0}
+          disabled={Boolean(selected) || !isAnswerOpen}
           mode="participant"
           onAnswer={submit}
           selectedId={selected}

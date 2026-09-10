@@ -78,3 +78,38 @@ test("deployment url and participant answer lookup index are documented", () => 
   assert.ok(envExampleSource.includes("NEXT_PUBLIC_APP_URL="));
   assert.ok(migrationSource.includes("participant_answers_participant_question_idx"));
 });
+
+test("question start uses a prepare window before the answer deadline", () => {
+  const constantsSource = readFileSync("src/lib/game/constants.ts", "utf8");
+  const startRouteSource = readFileSync("src/app/api/games/[gameId]/start/route.ts", "utf8");
+  const nextRouteSource = readFileSync("src/app/api/games/[gameId]/next/route.ts", "utf8");
+  const migrationSource = readFileSync("supabase/migrations/202609100004_question_start_delay_and_latency_grace.sql", "utf8");
+  assert.ok(constantsSource.includes("PREPARE_DELAY_MS = 2000"));
+  assert.ok(startRouteSource.includes("question_starts_at: startsAt.toISOString()"));
+  assert.ok(nextRouteSource.includes("question_starts_at: finished ? null : startsAt.toISOString()"));
+  assert.ok(migrationSource.includes("question_starts_at"));
+});
+
+test("deadline close and answer submission use server grace without client timestamps", () => {
+  const constantsSource = readFileSync("src/lib/game/constants.ts", "utf8");
+  const closeQuestionSource = readFileSync("src/lib/game/close-question.ts", "utf8");
+  const answerRouteSource = readFileSync("src/app/api/games/[gameId]/answer/route.ts", "utf8");
+  assert.ok(constantsSource.includes("ANSWER_NETWORK_GRACE_MS = 1500"));
+  assert.ok(closeQuestionSource.includes("ANSWER_NETWORK_GRACE_MS <= Date.now()"));
+  assert.ok(answerRouteSource.includes("endsAt + ANSWER_NETWORK_GRACE_MS <= now"));
+  assert.ok(answerRouteSource.includes("Math.min(now, endsAt) - startsAt"));
+  assert.equal(answerRouteSource.includes("clicked_at"), false);
+});
+
+test("clients use serverNow for countdown and participant answer is optimistic", () => {
+  const adminSource = readFileSync("src/components/admin/game-control.tsx", "utf8");
+  const playClientSource = readFileSync("src/components/participant/play-client.tsx", "utf8");
+  const questionRouteSource = readFileSync("src/app/api/games/[gameId]/question/route.ts", "utf8");
+  const hostQuestionRouteSource = readFileSync("src/app/api/games/[gameId]/host-question/route.ts", "utf8");
+  assert.ok(adminSource.includes("serverOffsetMs"));
+  assert.ok(playClientSource.includes("serverOffsetMs"));
+  assert.ok(questionRouteSource.includes("serverNow"));
+  assert.ok(hostQuestionRouteSource.includes("serverNow"));
+  assert.ok(playClientSource.includes("setSubmitted(true);"));
+  assert.ok(playClientSource.includes("!isAnswerOpen"));
+});

@@ -13,7 +13,7 @@ export async function GET(_request: NextRequest, context: { params: Promise<{ ga
 
     const { data: game } = await supabase
       .from("games")
-      .select("quiz_id,status,current_question_index,question_started_at,question_ends_at")
+      .select("quiz_id,status,current_question_index,question_started_at,question_starts_at,question_ends_at")
       .eq("id", gameId)
       .single();
     if (!game) {
@@ -33,11 +33,12 @@ export async function GET(_request: NextRequest, context: { params: Promise<{ ga
     return NextResponse.json({
       status: game.status,
       questionStartedAt: game.question_started_at,
+      questionStartsAt: game.question_starts_at,
       questionEndsAt: game.question_ends_at,
+      serverNow: new Date().toISOString(),
       question,
     });
   } catch (error) {
     return jsonError(parseError(error), error instanceof Error && error.message === "ADMIN_UNAUTHORIZED" ? 401 : 400);
   }
 }
-

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { maybeCloseQuestion } from "@/lib/game/close-question";
+import { ANSWER_NETWORK_GRACE_MS } from "@/lib/game/constants";
 import { jsonError, parseError } from "@/lib/http";
 import { calculateScore } from "@/lib/scoring/scoring";
 import { createServiceClient } from "@/lib/supabase/server";
@@ -12,7 +13,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ ga
     const supabase = createServiceClient();
     const { data: game } = await supabase
       .from("games")
-      .select("quiz_id,status,current_question_index,question_started_at,question_ends_at")
+      .select("quiz_id,status,current_question_index,question_started_at,question_starts_at,question_ends_at")
       .eq("id", gameId)
       .single();
 
@@ -21,10 +22,16 @@ export async function POST(request: NextRequest, context: { params: Promise<{ ga
     }
 
     const now = Date.now();
+    const startsAt = game.question_starts_at
+      ? new Date(game.question_starts_at as string).getTime()
+      : new Date(game.question_started_at as string).getTime();
+    if (Number.isFinite(startsAt) && startsAt > now) {
+      return jsonError("문제가 아직 시작되지 않았습니다.", 409);
+    }
     const endsAt = game.question_ends_at
       ? new Date(game.question_ends_at as string).getTime()
-      : new Date(game.question_started_at as string).getTime();
-    if (Number.isFinite(endsAt) && endsAt <= now) {
+      : startsAt;
+    if (Number.isFinite(endsAt) && endsAt + ANSWER_NETWORK_GRACE_MS <= now) {
       await maybeCloseQuestion(supabase, gameId, "expired");
       return jsonError("제한 시간이 지났습니다.", 409);
     }
@@ -59,7 +66,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ ga
       return jsonError("선택지를 찾을 수 없습니다.", 404);
     }
 
-    const responseTimeMs = now - new Date(game.question_started_at as string).getTime();
+    const responseTimeMs = Math.max(0, Math.min(now, endsAt) - startsAt);
     const scoreAwarded = calculateScore({
       isCorrect: Boolean(answer.is_correct),
       responseTimeMs,

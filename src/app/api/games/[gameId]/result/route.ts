@@ -29,7 +29,7 @@ export async function GET(_request: NextRequest, context: { params: Promise<{ ga
 
     const { data: game } = await supabase
       .from("games")
-      .select("id,quiz_id,status,current_question_index,question_started_at,question_ends_at,quizzes(questions(id))")
+      .select("id,quiz_id,status,current_question_index,question_started_at,question_starts_at,question_ends_at,quizzes(questions(id))")
       .eq("id", gameId)
       .single();
     if (!game) {
@@ -131,4 +131,3 @@ export async function GET(_request: NextRequest, context: { params: Promise<{ ga
     return jsonError(parseError(error), error instanceof Error && error.message === "ADMIN_UNAUTHORIZED" ? 401 : 400);
   }
 }
-

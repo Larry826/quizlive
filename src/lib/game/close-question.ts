@@ -1,4 +1,5 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
+import { ANSWER_NETWORK_GRACE_MS } from "@/lib/game/constants";
 
 type CloseReason = "manual" | "expired";
 
@@ -46,7 +47,7 @@ export async function maybeCloseQuestion(
 
   const canClose =
     reason === "manual" ||
-    Boolean(game.question_ends_at && new Date(game.question_ends_at as string).getTime() <= Date.now());
+    Boolean(game.question_ends_at && new Date(game.question_ends_at as string).getTime() + ANSWER_NETWORK_GRACE_MS <= Date.now());
 
   if (!canClose) {
     return { closed: false, status: "QUESTION", reason: "not_ready" };
@@ -70,4 +71,3 @@ export async function maybeCloseQuestion(
     reason,
   };
 }
-

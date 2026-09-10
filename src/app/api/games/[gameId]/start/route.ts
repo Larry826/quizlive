@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requireAdmin } from "@/lib/auth/session";
+import { PREPARE_DELAY_MS } from "@/lib/game/constants";
 import { jsonError, parseError } from "@/lib/http";
 import { createServiceClient } from "@/lib/supabase/server";
 
@@ -22,15 +23,17 @@ export async function POST(_request: NextRequest, context: { params: Promise<{ g
       .eq("quiz_id", game?.quiz_id)
       .eq("order_index", 0)
       .single();
-    const startedAt = new Date();
+    const transitionAt = new Date();
+    const startsAt = new Date(transitionAt.getTime() + PREPARE_DELAY_MS);
     const { error } = await supabase
       .from("games")
       .update({
         status: "QUESTION",
         current_question_index: 0,
-        started_at: startedAt.toISOString(),
-        question_started_at: startedAt.toISOString(),
-        question_ends_at: new Date(startedAt.getTime() + Number(firstQuestion?.time_limit ?? 15) * 1000).toISOString(),
+        started_at: transitionAt.toISOString(),
+        question_started_at: transitionAt.toISOString(),
+        question_starts_at: startsAt.toISOString(),
+        question_ends_at: new Date(startsAt.getTime() + Number(firstQuestion?.time_limit ?? 15) * 1000).toISOString(),
       })
       .eq("id", gameId)
       .eq("status", "LOBBY");

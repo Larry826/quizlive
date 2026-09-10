@@ -7,7 +7,7 @@ export async function GET(_request: NextRequest, context: { params: Promise<{ ga
   const supabase = createServiceClient();
   const { data: game, error } = await supabase
     .from("games")
-    .select("id,pin,status,current_question_index,question_started_at,question_ends_at,quizzes(title,questions(id))")
+    .select("id,pin,status,current_question_index,question_started_at,question_starts_at,question_ends_at,quizzes(title,questions(id))")
     .eq("id", gameId)
     .single();
   if (error || !game) {
@@ -18,5 +18,5 @@ export async function GET(_request: NextRequest, context: { params: Promise<{ ga
     .select("id", { count: "exact", head: true })
     .eq("game_id", gameId);
 
-  return NextResponse.json({ game, participantCount: count ?? 0 });
+  return NextResponse.json({ game, participantCount: count ?? 0, serverNow: new Date().toISOString() });
 }

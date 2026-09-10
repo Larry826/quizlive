@@ -5,7 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import QRCode from "qrcode";
 import { CheckCircle2, QrCode, StepForward, Users, X } from "lucide-react";
 import { AnswerGrid } from "@/components/game/answer-grid";
-import { ANSWER_LABELS } from "@/lib/game/constants";
+import { ANSWER_LABELS, ANSWER_NETWORK_GRACE_MS } from "@/lib/game/constants";
 import { createBrowserClient } from "@/lib/supabase/browser";
 
 type Participant = { id: string; nickname: string; score: number };
@@ -16,15 +16,19 @@ type Snapshot = {
     status: string;
     current_question_index: number;
     question_started_at: string | null;
+    question_starts_at: string | null;
     question_ends_at: string | null;
     quizzes: { title: string; questions: { id: string }[] };
   };
   participantCount: number;
+  serverNow: string;
 };
 type QuestionPayload = {
   status: string;
   questionStartedAt: string | null;
+  questionStartsAt: string | null;
   questionEndsAt: string | null;
+  serverNow: string;
   question: {
     id: string;
     question_text: string;
@@ -53,6 +57,7 @@ export function GameControl({ gameId }: { gameId: string }) {
   const [message, setMessage] = useState("");
   const [showCumulative, setShowCumulative] = useState(false);
   const [now, setNow] = useState(0);
+  const [serverOffsetMs, setServerOffsetMs] = useState(0);
   const refreshTimerRef = useRef<number | null>(null);
 
   const joinUrl = useMemo(() => {
@@ -60,6 +65,14 @@ export function GameControl({ gameId }: { gameId: string }) {
     const configuredUrl = process.env.NEXT_PUBLIC_APP_URL?.replace(/\/$/, "");
     return `${configuredUrl || window.location.origin}/join?pin=${snapshot.game.pin}`;
   }, [snapshot]);
+
+  const syncServerClock = useCallback((serverNow: string | null | undefined) => {
+    if (!serverNow) return;
+    const serverNowMs = new Date(serverNow).getTime();
+    if (Number.isFinite(serverNowMs)) {
+      setServerOffsetMs(serverNowMs - Date.now());
+    }
+  }, []);
 
   const refresh = useCallback(async () => {
     const [snapshotResponse, participantsResponse, questionResponse, resultResponse] = await Promise.all([
@@ -69,14 +82,22 @@ export function GameControl({ gameId }: { gameId: string }) {
       fetch(`/api/games/${gameId}/result`).catch(() => null),
     ]);
 
-    if (snapshotResponse.ok) setSnapshot((await snapshotResponse.json()) as Snapshot);
+    if (snapshotResponse.ok) {
+      const body = (await snapshotResponse.json()) as Snapshot;
+      syncServerClock(body.serverNow);
+      setSnapshot(body);
+    }
     if (participantsResponse.ok) {
       const body = (await participantsResponse.json()) as { participants: Participant[] };
       setParticipants(body.participants);
     }
-    if (questionResponse?.ok) setQuestion((await questionResponse.json()) as QuestionPayload);
+    if (questionResponse?.ok) {
+      const body = (await questionResponse.json()) as QuestionPayload;
+      syncServerClock(body.serverNow);
+      setQuestion(body);
+    }
     if (resultResponse?.ok) setResult((await resultResponse.json()) as ResultPayload);
-  }, [gameId]);
+  }, [gameId, syncServerClock]);
 
   const scheduleRefresh = useCallback(() => {
     if (refreshTimerRef.current) {
@@ -127,17 +148,29 @@ export function GameControl({ gameId }: { gameId: string }) {
 
   const remaining = useMemo(() => {
     const endsAt = question?.questionEndsAt ?? snapshot?.game.question_ends_at;
-    if (!endsAt || !now) return question?.question.time_limit ?? 0;
-    return Math.max(0, Math.ceil((new Date(endsAt).getTime() - now) / 1000));
-  }, [now, question, snapshot?.game.question_ends_at]);
+    const startsAt = question?.questionStartsAt ?? snapshot?.game.question_starts_at;
+    const effectiveNow = now + serverOffsetMs;
+    if (!endsAt || !effectiveNow) return question?.question.time_limit ?? 0;
+    if (startsAt && new Date(startsAt).getTime() > effectiveNow) {
+      return question?.question.time_limit ?? 0;
+    }
+    return Math.max(0, Math.ceil((new Date(endsAt).getTime() - effectiveNow) / 1000));
+  }, [now, question, serverOffsetMs, snapshot?.game.question_ends_at, snapshot?.game.question_starts_at]);
+
+  const settleDelayMs = useMemo(() => {
+    const endsAt = question?.questionEndsAt ?? snapshot?.game.question_ends_at;
+    if (!endsAt || !now) return ANSWER_NETWORK_GRACE_MS;
+    const effectiveNow = now + serverOffsetMs;
+    return Math.max(0, new Date(endsAt).getTime() + ANSWER_NETWORK_GRACE_MS - effectiveNow);
+  }, [now, question?.questionEndsAt, serverOffsetMs, snapshot?.game.question_ends_at]);
 
   useEffect(() => {
     if (snapshot?.game.status !== "QUESTION" || remaining > 0) return;
     const timer = window.setTimeout(() => {
       void fetch(`/api/games/${gameId}/auto-close`, { method: "POST" }).then(() => refresh());
-    }, 0);
+    }, settleDelayMs + 50);
     return () => window.clearTimeout(timer);
-  }, [gameId, refresh, remaining, snapshot?.game.status]);
+  }, [gameId, refresh, remaining, settleDelayMs, snapshot?.game.status]);
 
   async function command(path: string) {
     setMessage("");
@@ -163,6 +196,7 @@ export function GameControl({ gameId }: { gameId: string }) {
         questionCount={questionCount}
         questionIndex={snapshot?.game.current_question_index ?? 0}
         remaining={remaining}
+        settling={remaining === 0}
         submittedCount={submittedCount}
       />
     );
@@ -214,6 +248,7 @@ function QuestionPresenterView({
   questionCount,
   questionIndex,
   remaining,
+  settling,
   submittedCount,
 }: {
   onEnd: () => void;
@@ -222,6 +257,7 @@ function QuestionPresenterView({
   questionCount: number;
   questionIndex: number;
   remaining: number;
+  settling: boolean;
   submittedCount: number;
 }) {
   return (
@@ -229,7 +265,9 @@ function QuestionPresenterView({
       <header className="grid min-h-0 grid-cols-3 items-center gap-3 rounded-[8px] bg-white px-[clamp(0.75rem,1.4vw,1.5rem)] py-[clamp(0.45rem,1vh,0.8rem)] shadow-sm">
         <div className="text-[clamp(1rem,2.4vh,1.8rem)] font-black">문제 {questionIndex + 1} / {questionCount}</div>
         <div className="text-center text-[clamp(1rem,2.4vh,1.8rem)] font-black">답변 {submittedCount} / {participantCount}</div>
-        <div className="text-right text-[clamp(1.1rem,3.2vh,2.4rem)] font-black">남은 시간 {remaining}초</div>
+        <div className="text-right text-[clamp(1.1rem,3.2vh,2.4rem)] font-black">
+          {settling ? "응답 집계 중..." : `남은 시간 ${remaining}초`}
+        </div>
       </header>
 
       <section className="grid min-h-0 flex-[0_0_16vh] place-items-center px-[clamp(0.5rem,1vw,1rem)] py-[clamp(0.35rem,1vh,0.75rem)]">

@@ -39,6 +39,7 @@ create table if not exists public.games (
   status text not null default 'LOBBY' check (status in ('LOBBY','QUESTION','QUESTION_RESULT','LEADERBOARD','FINISHED')),
   current_question_index integer not null default 0 check (current_question_index >= 0),
   question_started_at timestamptz,
+  question_starts_at timestamptz,
   question_ends_at timestamptz,
   created_at timestamptz not null default now(),
   started_at timestamptz,
